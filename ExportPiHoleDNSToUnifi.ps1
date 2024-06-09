@@ -11,6 +11,8 @@ param(
     $TestRecord
 )
 
+$Script:GlobalWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+
 function Get-UnifiAuth{
     param($URL,$Username,$Pw)
 
@@ -23,50 +25,48 @@ function Get-UnifiAuth{
         password = $pw
     } | ConvertTo-Json
 
-    $Response = Invoke-WebRequest -Uri $URI -Body $jsonbody -ContentType "application/json" -Method Post -SessionVariable websession
+    $Response = Invoke-WebRequest -Uri $URI -Body $jsonbody -ContentType "application/json" -Method Post -WebSession $Script:GlobalWebSession -ErrorAction SilentlyContinue
 
     if($Response.StatusCode -eq 200){
-        return $websession
+        return $Response
     } else {
         return "Unknown error"
     }
 }
 
 function Add-UnifiDNSARecord{
-    param($URL,$WebSession,$Key,$Value)
+    param($URL,$Key,$Value)
 
     #Check DNS Entries for potential conflict
-    $DNSEntriesBefore = Invoke-RestMethod -Uri "$URL/proxy/network/v2/api/site/default/static-dns/devices" -ContentType "application/json" -WebSession $WebSession
+    try{
+        $DNSEntriesBefore = Invoke-RestMethod -Uri "$URL/proxy/network/v2/api/site/default/static-dns" -ContentType "application/json" -WebSession $Script:GlobalWebSession -ErrorAction Stop #Static DNS Entries
+        $DeviceEntriesBefore = Invoke-RestMethod -Uri "$URL/proxy/network/v2/api/site/default/static-dns/devices" -ContentType "application/json" -WebSession $Script:GlobalWebSession -ErrorAction Stop #Device Entries
 
-    if($Key -in $DNSEntriesBefore.hostname){
-        return "AlreadyPresent"
-    } else {
-        if($EvaluationOnly){
-            return "EvaluationMode"
+        if($Key -in $DNSEntriesBefore.key -or $Key -in $DeviceEntriesBefore.hostname){
+            return "AlreadyPresent"
         } else {
-            $JSONBody = @{
-                "record_type" = "A"
-                "value" = $Value
-                "key" = $Key
-                "enabled" = $true
-            } | ConvertTo-Json
-            
-            #This seems to be responding with 403 every time, needs more investigation
-            $AddResponse = Invoke-RestMethod -Uri "$URL/proxy/network/v2/api/site/default/static-dns" -Body $JSONBody -ContentType "application/json" -Method Post -WebSession $WebSession
-            
-            #Get updated list of current DNS entries
-            $DNSEntries = Invoke-RestMethod -Uri "$URL/proxy/network/v2/api/site/default/static-dns/devices" -ContentType "application/json" -WebSession $WebSession
-            
-            if($DNSEntries){
-                if($Key -in $DNSEntries.hostname){
+            if($EvaluationOnly){
+                return "EvaluationMode"
+            } else {
+                $JSONBody = @{
+                    "record_type" = "A"
+                    "value" = $Value
+                    "key" = $Key
+                    "enabled" = $true
+                } | ConvertTo-Json
+                
+                #This seems to be responding with 403 every time, needs more investigation
+                $AddResponse = Invoke-RestMethod -Uri "$URL/proxy/network/v2/api/site/default/static-dns" -Body $JSONBody -ContentType "application/json" -Method Post -WebSession $Script:GlobalWebSession -ErrorAction Stop
+                
+                if($AddResponse._id){
                     return "Success"
                 } else {
                     return "Failure"
                 }
-            } else {
-                return "Failure"
             }
         }
+    } catch {
+        return "UnknownFailure"
     }
 }
 
@@ -108,9 +108,18 @@ if($PSVersionTable.PSEdition -ne "Core"){
     }
 }
 
-$PiHoleURL = Read-Host "Enter Pi Hole URL (ex. http://pihole)"
+$PiHoleURL = Read-Host "Enter Pi Hole URL (defaults to http://pihole if blank)"
+if(!($PiHoleURL)){
+    $PiHoleURL = "http://pihole"
+}
+
 $PiHoleAPIToken = Read-Host "Paste Pi Hole API token"
-$UnifiURL = Read-Host "Enter Unifi URL (ex. https://unifi)"
+Write-Warning "Only UDM Pro network controllers are supported due to differences in API endpoints"
+$UnifiURL = Read-Host "Enter Unifi URL (defaults to https://unifi if blank)"
+if(!($UnifiURL)){
+    $UnifiURL = "https://unifi"
+}
+
 $UnifiCredentials = Get-Credential -Message "Enter Unifi account credentials (local account suggested)"
 $UnifiUsername = $UnifiCredentials.UserName
 $UnifiPassword = $UnifiCredentials.GetNetworkCredential().password
@@ -127,14 +136,19 @@ if($DNSData -and $DNSData -ne "Unknown error"){
     Write-Progress -Activity " " -Completed
 
     if($UnifiSession -and $UnifiSession -ne "Unknown error"){
+        #Add the proper headers so that the API has everything it wants to allow the request to proceed
+        $UnifiSession.Headers.GetEnumerator() | ForEach-Object {$script:GlobalWebSession.Headers.Add($_.key,$_.value)}
+        $Script:GlobalWebSession.Headers.Remove("Content-Length") | Out-Null #Prevents error since the length might not match our original response
+
         if($TestRecord){
-            Add-UnifiDNSARecord -URL $UnifiURL -WebSession $UnifiSession -Key "test" -Value "192.168.20.21"
+            Add-UnifiDNSARecord -URL $UnifiURL -Key "test" -Value "192.168.99.998"
+            Add-UnifiDNSARecord -URL $UnifiURL -Key "test2" -Value "192.168.99.999"
         } else {
             $Count = 0
             foreach($ARecord in $DNSData.GetEnumerator()){
                 $Count++
                 Write-Progress -Activity "Processing DNS Record: $($ARecord.Name) ($Count/$($DNSData.count))"
-                $Result = Add-UnifiDNSARecord -URL $UnifiURL -WebSession $UnifiSession -Key $ARecord.Name -Value $ARecord.Value
+                $Result = Add-UnifiDNSARecord -URL $UnifiURL -Key $ARecord.Name -Value $ARecord.Value
                 if($Result -eq "Failure"){
                     Write-Error "Unable to add $($ARecord.Name)"
                 } elseif ($Result -eq "AlreadyPresent"){
@@ -143,6 +157,10 @@ if($DNSData -and $DNSData -ne "Unknown error"){
                     Write-Host "Successfully added $($ARecord.Name) to Unifi DNS" -ForegroundColor Green
                 } elseif ($Result -eq "EvaluationMode"){
                     Write-Host "$($ARecord.Name) is not present in the Unifi DNS"
+                } elseif ($Result -eq "UnknownFailure"){
+                    Write-Error "Unknown error occurred attempting to add $($ARecord.Name), unable to continue"
+                    Read-Host "Press enter to exit"
+                    Exit 1603
                 }
             }
         }
